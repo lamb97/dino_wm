@@ -1,0 +1,21 @@
+name: droid
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.droid_dset.load_droid_slice_train_val"
+  data_path: ${oc.env:DATASET_DIR}/droid_100/1.0.0
+  split: train
+  n_rollout: 100
+  normalize_action: ${normalize_action}
+  split_ratio: 0.9
+  camera_key: exterior_image_1_left
+  action_key: action
+  proprio_keys: [joint_position, gripper_position]
+  state_keys: [joint_position, gripper_position]
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 0

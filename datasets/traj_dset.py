@@ -49,6 +49,18 @@ class TrajSubset(TrajDataset, Subset):
             return getattr(self.dataset, name)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
+    def get_slice(self, i, start, end, frameskip, num_frames):
+        if not hasattr(self.dataset, "get_slice"):
+            raise AttributeError(f"'{type(self.dataset).__name__}' has no attribute 'get_slice'")
+        mapped_i = self.indices[i]
+        return self.dataset.get_slice(
+            i=mapped_i,
+            start=start,
+            end=end,
+            frameskip=frameskip,
+            num_frames=num_frames,
+        )
+
 
 class TrajSlicerDataset(TrajDataset):
     def __init__(
@@ -57,20 +69,28 @@ class TrajSlicerDataset(TrajDataset):
         num_frames: int,
         frameskip: int = 1,
         process_actions: str = "concat",
+        max_slices_per_traj: Optional[int] = None,
     ):
         self.dataset = dataset
         self.num_frames = num_frames
         self.frameskip = frameskip
+        self.max_slices_per_traj = max_slices_per_traj
         self.slices = []
         for i in range(len(self.dataset)): 
             T = self.dataset.get_seq_length(i)
             if T - num_frames < 0:
                 print(f"Ignored short sequence #{i}: len={T}, num_frames={num_frames}")
             else:
-                self.slices += [
+                cur_slices = [
                     (i, start, start + num_frames * self.frameskip)
                     for start in range(T - num_frames * frameskip + 1)
                 ]  # slice indices follow convention [start, end)
+                if self.max_slices_per_traj is not None and len(cur_slices) > self.max_slices_per_traj:
+                    keep_idx = np.random.choice(
+                        len(cur_slices), size=self.max_slices_per_traj, replace=False
+                    )
+                    cur_slices = [cur_slices[j] for j in keep_idx]
+                self.slices += cur_slices
         # randomly permute the slices
         self.slices = np.random.permutation(self.slices)
         
@@ -91,6 +111,15 @@ class TrajSlicerDataset(TrajDataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
+        # Optional fast path for datasets that can return sliced tensors directly.
+        if hasattr(self.dataset, "get_slice"):
+            return self.dataset.get_slice(
+                i=i,
+                start=start,
+                end=end,
+                frameskip=self.frameskip,
+                num_frames=self.num_frames,
+            )
         obs, act, state, _ = self.dataset[i]
         for k, v in obs.items():
             obs[k] = v[start:end:self.frameskip]
@@ -141,12 +170,23 @@ def get_train_val_sliced(
     random_seed: int = 42,
     num_frames: int = 10,
     frameskip: int = 1,
+    max_slices_per_traj: Optional[int] = None,
 ):
     train, val = split_traj_datasets(
         traj_dataset,
         train_fraction=train_fraction,
         random_seed=random_seed,
     )
-    train_slices = TrajSlicerDataset(train, num_frames, frameskip)
-    val_slices = TrajSlicerDataset(val, num_frames, frameskip)
+    train_slices = TrajSlicerDataset(
+        train,
+        num_frames,
+        frameskip,
+        max_slices_per_traj=max_slices_per_traj,
+    )
+    val_slices = TrajSlicerDataset(
+        val,
+        num_frames,
+        frameskip,
+        max_slices_per_traj=max_slices_per_traj,
+    )
     return train, val, train_slices, val_slices

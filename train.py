@@ -2,6 +2,7 @@ import os
 import time
 import hydra
 import torch
+import torch.nn as nn
 import wandb
 import logging
 import warnings
@@ -68,6 +69,8 @@ class Trainer:
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        self.global_step = 0
+        self.batch_in_epoch = 0
 
         assert cfg.training.batch_size % self.accelerator.num_processes == 0, (
             "Batch size must be divisible by the number of processes. "
@@ -154,6 +157,8 @@ class Trainer:
 
         self._keys_to_save = [
             "epoch",
+            "global_step",
+            "batch_in_epoch",
         ]
         self._keys_to_save += (
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
@@ -164,30 +169,44 @@ class Trainer:
             else []
         )
         self._keys_to_save += (
+            ["action_encoder_optimizer"]
+            if self.train_predictor and self.cfg.has_predictor
+            else []
+        )
+        self._keys_to_save += (
             ["decoder", "decoder_optimizer"] if self.train_decoder else []
         )
         self._keys_to_save += ["action_encoder", "proprio_encoder"]
+        self._loaded_module_states = {}
+        self._loaded_optimizer_states = {}
 
         self.init_models()
         self.init_optimizers()
 
         self.epoch_log = OrderedDict()
 
-    def save_ckpt(self):
+    def save_ckpt(self, suffix=None):
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             if not os.path.exists("checkpoints"):
                 os.makedirs("checkpoints")
             ckpt = {}
             for k in self._keys_to_save:
-                if hasattr(self.__dict__[k], "module"):
-                    ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
+                obj = self.__dict__[k]
+                if isinstance(obj, nn.Module):
+                    ckpt[k] = self.accelerator.unwrap_model(obj).state_dict()
+                elif isinstance(obj, torch.optim.Optimizer):
+                    ckpt[k] = obj.state_dict()
                 else:
-                    ckpt[k] = self.__dict__[k]
+                    ckpt[k] = obj
             torch.save(ckpt, "checkpoints/model_latest.pth")
-            torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+            if suffix is None:
+                ckpt_name = f"model_{self.epoch}.pth"
+            else:
+                ckpt_name = f"model_{suffix}.pth"
+            torch.save(ckpt, f"checkpoints/{ckpt_name}")
             log.info("Saved model to {}".format(os.getcwd()))
-            ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
+            ckpt_path = os.path.join(os.getcwd(), f"checkpoints/{ckpt_name}")
         else:
             ckpt_path = None
         model_name = self.cfg["saved_folder"].split("outputs/")[-1]
@@ -195,24 +214,51 @@ class Trainer:
         return ckpt_path, model_name, model_epoch
 
     def load_ckpt(self, filename="model_latest.pth"):
-        ckpt = torch.load(filename)
+        ckpt = torch.load(filename, map_location="cpu")
+        self._loaded_module_states = {}
+        self._loaded_optimizer_states = {}
         for k, v in ckpt.items():
-            self.__dict__[k] = v
+            if k.endswith("_optimizer"):
+                if isinstance(v, dict):
+                    self._loaded_optimizer_states[k] = v
+                else:
+                    self.__dict__[k] = v
+            elif k in {"encoder", "predictor", "decoder", "action_encoder", "proprio_encoder"}:
+                if isinstance(v, dict):
+                    self._loaded_module_states[k] = v
+                else:
+                    self.__dict__[k] = v
+            else:
+                self.__dict__[k] = v
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
         if len(not_in_ckpt):
             log.warning("Keys not found in ckpt: %s", not_in_ckpt)
+
+    def _restore_module_state_if_available(self, key):
+        if key in self._loaded_module_states and hasattr(self, key) and self.__dict__[key] is not None:
+            missing, unexpected = self.__dict__[key].load_state_dict(
+                self._loaded_module_states[key], strict=False
+            )
+            if len(missing) or len(unexpected):
+                log.warning(
+                    f"While loading {key} state_dict, missing={missing}, unexpected={unexpected}"
+                )
 
     def init_models(self):
         model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
-            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+            log.info(
+                f"Resuming from epoch {self.epoch}, iter {self.batch_in_epoch}, "
+                f"global_step {self.global_step}: {model_ckpt}"
+            )
 
         # initialize encoder
         if self.encoder is None:
             self.encoder = hydra.utils.instantiate(
                 self.cfg.encoder,
             )
+        self._restore_module_state_if_available("encoder")
         if not self.train_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
@@ -222,6 +268,7 @@ class Trainer:
             in_chans=self.datasets["train"].proprio_dim,
             emb_dim=self.cfg.proprio_emb_dim,
         )
+        self._restore_module_state_if_available("proprio_encoder")
         proprio_emb_dim = self.proprio_encoder.emb_dim
         print(f"Proprio encoder type: {type(self.proprio_encoder)}")
         self.proprio_encoder = self.accelerator.prepare(self.proprio_encoder)
@@ -231,6 +278,7 @@ class Trainer:
             in_chans=self.datasets["train"].action_dim,
             emb_dim=self.cfg.action_emb_dim,
         )
+        self._restore_module_state_if_available("action_encoder")
         action_emb_dim = self.action_encoder.emb_dim
         print(f"Action encoder type: {type(self.action_encoder)}")
 
@@ -263,7 +311,8 @@ class Trainer:
                         + action_emb_dim * self.cfg.num_action_repeat
                     )
                     * (self.cfg.concat_dim),
-                )
+                    )
+            self._restore_module_state_if_available("predictor")
             if not self.train_predictor:
                 for param in self.predictor.parameters():
                     param.requires_grad = False
@@ -286,6 +335,7 @@ class Trainer:
                         self.cfg.decoder,
                         emb_dim=self.encoder.emb_dim,  # 384
                     )
+            self._restore_module_state_if_available("decoder")
             if not self.train_decoder:
                 for param in self.decoder.parameters():
                     param.requires_grad = False
@@ -312,6 +362,10 @@ class Trainer:
             lr=self.cfg.training.encoder_lr,
         )
         self.encoder_optimizer = self.accelerator.prepare(self.encoder_optimizer)
+        if "encoder_optimizer" in self._loaded_optimizer_states:
+            self.encoder_optimizer.load_state_dict(
+                self._loaded_optimizer_states["encoder_optimizer"]
+            )
         if self.cfg.has_predictor:
             self.predictor_optimizer = torch.optim.AdamW(
                 self.predictor.parameters(),
@@ -320,6 +374,10 @@ class Trainer:
             self.predictor_optimizer = self.accelerator.prepare(
                 self.predictor_optimizer
             )
+            if "predictor_optimizer" in self._loaded_optimizer_states:
+                self.predictor_optimizer.load_state_dict(
+                    self._loaded_optimizer_states["predictor_optimizer"]
+                )
 
             self.action_encoder_optimizer = torch.optim.AdamW(
                 itertools.chain(
@@ -330,12 +388,20 @@ class Trainer:
             self.action_encoder_optimizer = self.accelerator.prepare(
                 self.action_encoder_optimizer
             )
+            if "action_encoder_optimizer" in self._loaded_optimizer_states:
+                self.action_encoder_optimizer.load_state_dict(
+                    self._loaded_optimizer_states["action_encoder_optimizer"]
+                )
 
         if self.cfg.has_decoder:
             self.decoder_optimizer = torch.optim.Adam(
                 self.decoder.parameters(), lr=self.cfg.training.decoder_lr
             )
             self.decoder_optimizer = self.accelerator.prepare(self.decoder_optimizer)
+            if "decoder_optimizer" in self._loaded_optimizer_states:
+                self.decoder_optimizer.load_state_dict(
+                    self._loaded_optimizer_states["decoder_optimizer"]
+                )
 
     def monitor_jobs(self, lock):
         """
@@ -368,14 +434,17 @@ class Trainer:
             )
             self.monitor_thread.start()
 
-        init_epoch = self.epoch + 1  # epoch starts from 1
+        # Epoch starts from 1. If resuming from a mid-epoch checkpoint, continue that epoch.
+        init_epoch = self.epoch if self.batch_in_epoch > 0 else self.epoch + 1
         for epoch in range(init_epoch, init_epoch + self.total_epochs):
             self.epoch = epoch
             self.accelerator.wait_for_everyone()
-            self.train()
+            start_iter = self.batch_in_epoch if epoch == init_epoch else 0
+            self.train(start_iter=start_iter)
             self.accelerator.wait_for_everyone()
             self.val()
             self.logs_flash(step=self.epoch)
+            self.batch_in_epoch = 0
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
@@ -439,12 +508,29 @@ class Trainer:
 
         return logs
 
-    def train(self):
-        for i, data in enumerate(
-            tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
+    def train(self, start_iter=0):
+        train_loader = self.dataloaders["train"]
+        total_batches = len(train_loader)
+        start_iter = int(start_iter)
+        if start_iter >= total_batches:
+            log.warning(
+                f"Resume iter {start_iter} is >= total train iters {total_batches}; "
+                "skipping training for this epoch."
+            )
+            self.batch_in_epoch = 0
+            return
+
+        train_iter = itertools.islice(train_loader, start_iter, None)
+        for local_i, data in enumerate(
+            tqdm(
+                train_iter,
+                total=total_batches - start_iter,
+                desc=f"Epoch {self.epoch} Train",
+            )
         ):
+            i = start_iter + local_i
             obs, act, state = data
-            plot = i == 0  # only plot from the first batch
+            plot = local_i == 0  # only plot from the first seen batch this call
             self.model.train()
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
@@ -466,6 +552,9 @@ class Trainer:
             if self.cfg.has_predictor and self.model.train_predictor:
                 self.predictor_optimizer.step()
                 self.action_encoder_optimizer.step()
+
+            self.global_step += 1
+            self.batch_in_epoch = i + 1
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
@@ -533,6 +622,12 @@ class Trainer:
 
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
+
+            save_every_x_iter = int(getattr(self.cfg.training, "save_every_x_iter", 0))
+            if save_every_x_iter > 0 and self.global_step % save_every_x_iter == 0:
+                self.save_ckpt(suffix=f"step_{self.global_step}")
+
+        self.batch_in_epoch = 0
 
     def val(self):
         self.model.eval()

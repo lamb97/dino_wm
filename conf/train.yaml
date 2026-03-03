@@ -34,6 +34,7 @@ training:
   epochs: 100
   batch_size: 32 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
+  save_every_x_iter: 0 # if >0, also save mid-epoch every N iterations
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
   encoder_lr: 1e-6
