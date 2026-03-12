@@ -44,6 +44,10 @@ class TrajSubset(TrajDataset, Subset):
     def get_seq_length(self, idx):
         return self.dataset.get_seq_length(self.indices[idx])
 
+    def get_frames(self, idx, frames):
+        # Map subset-local trajectory index to the original dataset index.
+        return self.dataset.get_frames(self.indices[idx], frames)
+
     def __getattr__(self, name):
         if hasattr(self.dataset, name):
             return getattr(self.dataset, name)
@@ -91,12 +95,20 @@ class TrajSlicerDataset(TrajDataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
-        obs, act, state, _ = self.dataset[i]
+        if hasattr(self.dataset, "get_frames"):
+            # Load only the current slice window to avoid materializing full trajectories.
+            obs, act, state, _ = self.dataset.get_frames(i, range(start, end))
+        else:
+            obs, act, state, _ = self.dataset[i]
+            for k, v in obs.items():
+                obs[k] = v[start:end]
+            state = state[start:end]
+            act = act[start:end]
+
         for k, v in obs.items():
-            obs[k] = v[start:end:self.frameskip]
-        state = state[start:end:self.frameskip]
-        act = act[start:end]
-        act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames)  # concat actions
+            obs[k] = v[::self.frameskip]
+        state = state[::self.frameskip]
+        act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames, f=self.frameskip)
         return tuple([obs, act, state])
 
 

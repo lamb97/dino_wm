@@ -66,8 +66,10 @@ class Trainer:
         self.base_path = os.path.dirname(os.path.abspath(__file__))
 
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
+        self.log_every_n_steps = max(int(self.cfg.training.log_every_n_steps), 1)
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        self.global_step = 0
 
         assert cfg.training.batch_size % self.accelerator.num_processes == 0, (
             "Batch size must be divisible by the number of processes. "
@@ -103,6 +105,11 @@ class Trainer:
                     id=wandb_run_id,
                     resume="allow",
                 )
+            # Keep iteration- and epoch-level curves on separate x-axes in W&B.
+            self.wandb_run.define_metric("global_step")
+            self.wandb_run.define_metric("iter/*", step_metric="global_step")
+            self.wandb_run.define_metric("epoch")
+            self.wandb_run.define_metric("epoch/*", step_metric="epoch")
             OmegaConf.set_struct(cfg, False)
             cfg.wandb_run_id = self.wandb_run.id
             OmegaConf.set_struct(cfg, True)
@@ -154,6 +161,7 @@ class Trainer:
 
         self._keys_to_save = [
             "epoch",
+            "global_step",
         ]
         self._keys_to_save += (
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
@@ -289,9 +297,26 @@ class Trainer:
             if not self.train_decoder:
                 for param in self.decoder.parameters():
                     param.requires_grad = False
-        self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
-            self.encoder, self.predictor, self.decoder
-        )
+
+        # Only wrap trainable modules with DDP; frozen modules should just be moved
+        # to device, otherwise DDP can error on modules with no grad params.
+        if self.train_encoder:
+            self.encoder = self.accelerator.prepare(self.encoder)
+        else:
+            self.encoder = self.encoder.to(self.device)
+
+        if self.cfg.has_predictor and self.predictor is not None:
+            if self.train_predictor:
+                self.predictor = self.accelerator.prepare(self.predictor)
+            else:
+                self.predictor = self.predictor.to(self.device)
+
+        if self.cfg.has_decoder and self.decoder is not None:
+            if self.train_decoder:
+                self.decoder = self.accelerator.prepare(self.decoder)
+            else:
+                self.decoder = self.decoder.to(self.device)
+
         self.model = hydra.utils.instantiate(
             self.cfg.model,
             encoder=self.encoder,
@@ -473,6 +498,17 @@ class Trainer:
             loss_components = {
                 key: value.mean().item() for key, value in loss_components.items()
             }
+            self.global_step += 1
+            if self.accelerator.is_main_process and self.global_step % self.log_every_n_steps == 0:
+                iter_logs = {
+                    "global_step": self.global_step,
+                    "iter/train_loss": loss.item(),
+                }
+                iter_logs.update(
+                    {f"iter/train_{key}": value for key, value in loss_components.items()}
+                )
+                self.wandb_run.log(iter_logs)
+
             if self.cfg.has_decoder and plot:
                 # only eval images when plotting due to speed
                 if self.cfg.has_predictor:
@@ -741,7 +777,11 @@ class Trainer:
                 Validation loss: {epoch_log['val_loss']:.4f}")
 
         if self.accelerator.is_main_process:
-            self.wandb_run.log(epoch_log)
+            wandb_epoch_log = {"epoch": step}
+            wandb_epoch_log.update(
+                {f"epoch/{key}": value for key, value in epoch_log.items() if key != "epoch"}
+            )
+            self.wandb_run.log(wandb_epoch_log)
         self.epoch_log = OrderedDict()
 
     def plot_samples(

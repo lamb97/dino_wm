@@ -1,0 +1,21 @@
+name: libero
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.libero_delta_dset.load_libero_slice_train_val"
+  n_rollout: null
+  normalize_action: ${normalize_action}
+  data_path: ${oc.env:DATASET_DIR}/libero_raw_delta_xyz_base_224
+  split_ratio: 0.9
+  use_mmap: false
+  mmap_mode: r
+  image_use_mmap: true
+  image_mmap_mode: r
+  image_cache_size: 8
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 16

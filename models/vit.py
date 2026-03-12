@@ -55,7 +55,12 @@ class Attention(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
         ) if project_out else nn.Identity()
-        self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')
+        # Keep mask device-agnostic; Accelerate/DDP will move buffers with the module.
+        self.register_buffer(
+            "bias",
+            generate_mask_matrix(NUM_PATCHES, NUM_FRAMES),
+            persistent=False,
+        )
 
     def forward(self, x):
         (
