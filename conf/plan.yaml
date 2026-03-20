@@ -26,11 +26,16 @@ hydra:
 ckpt_base_path: ./ # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: null
 model_epoch: latest
+dataset_path: null    # optional override for model_cfg.env.dataset.data_path
+dataset_target: null  # optional override for model_cfg.env.dataset._target_
 
 seed: 99
-n_evals: 10
+n_evals: 1
 goal_source: 'dset' # 'random_state' or 'dset' or 'random_action' 
 goal_H: 5 # specifies how far away the goal is if goal_source is 'dset'
+full_episode: false # if true (with goal_source=dset/random_action), use a full episode from t=0
+full_episode_traj_id: null # optional fixed trajectory id when full_episode=true
+full_episode_goal_H: null # optional fixed goal position in the chosen full episode, in downsampled steps from t=0
 n_plot_samples: 10
 
 debug_dset_init: False

@@ -120,7 +120,9 @@ class CEMPlanner(BasePlanner):
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": np.mean(losses), "step": i + 1}
             )
-            if self.evaluator is not None and i % self.eval_every == 0:
+            # Evaluate based on 1-indexed optimization step count.
+            # This makes eval_every=30 mean "evaluate at step 30, 60, ...".
+            if self.evaluator is not None and (i + 1) % self.eval_every == 0:
                 logs, successes, _, _ = self.evaluator.eval_actions(
                     mu, filename=f"{self.logging_prefix}_output_{i+1}"
                 )

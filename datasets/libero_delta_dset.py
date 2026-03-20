@@ -1,4 +1,5 @@
 import re
+import json
 import numpy as np
 import torch
 from pathlib import Path
@@ -35,6 +36,8 @@ class LiberoDeltaDataset(TrajDataset):
         self.image_cache_size = max(int(image_cache_size), 1)
         self._image_cache = OrderedDict()
         self._image_lengths = {}
+        self._episode_meta = {}
+        self._sim_state_dir = self.data_path / "sim_states"
 
         self.states = None
         self.actions = None
@@ -75,6 +78,7 @@ class LiberoDeltaDataset(TrajDataset):
 
         self._pth_obs_index = self._build_obs_index(self.data_path / "obses", suffix=".pth")
         self._npy_obs_index = self._build_obs_index(self.data_path / "obses_npy", suffix=".npy")
+        self._load_episode_meta()
 
         if self.image_use_mmap and len(self._npy_obs_index) > 0:
             self.image_storage_mode = "mmap_npy"
@@ -92,12 +96,16 @@ class LiberoDeltaDataset(TrajDataset):
 
         if normalize_action:
             self.action_mean, self.action_std = self._compute_mean_std(self.actions, self.seq_lengths)
-            self.proprio_mean, self.proprio_std = self._compute_mean_std(self.states, self.seq_lengths)
+            self.state_mean, self.state_std = self._compute_mean_std(self.states, self.seq_lengths)
+            self.proprio_mean, self.proprio_std = self.state_mean.clone(), self.state_std.clone()
             self.action_std = torch.clamp(self.action_std, min=1e-6)
+            self.state_std = torch.clamp(self.state_std, min=1e-6)
             self.proprio_std = torch.clamp(self.proprio_std, min=1e-6)
         else:
             self.action_mean = torch.zeros(self.action_dim)
             self.action_std = torch.ones(self.action_dim)
+            self.state_mean = torch.zeros(self.state_dim)
+            self.state_std = torch.ones(self.state_dim)
             self.proprio_mean = torch.zeros(self.proprio_dim)
             self.proprio_std = torch.ones(self.proprio_dim)
 
@@ -105,6 +113,19 @@ class LiberoDeltaDataset(TrajDataset):
             f"Loaded {self.n_rollout} LIBERO trajectories from {self.data_path} "
             f"(state/action={self.storage_mode}, images={self.image_storage_mode}, normalize_action={self.normalize_action})"
         )
+
+    def _load_episode_meta(self):
+        meta_path = self.data_path / "episode_meta.jsonl"
+        if not meta_path.exists():
+            return
+        with meta_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if "converted_index" in entry:
+                    self._episode_meta[int(entry["converted_index"])] = entry
 
     @staticmethod
     def _shape_last_dim(arr):
@@ -240,7 +261,34 @@ class LiberoDeltaDataset(TrajDataset):
             proprio = state
 
         obs = {"visual": image, "proprio": proprio}
-        return obs, act, state, {}
+        env_info = self._build_env_info(idx)
+        return obs, act, state, env_info
+
+    def _build_env_info(self, idx):
+        env_info = {"episode_idx": int(idx)}
+        meta = self._episode_meta.get(int(idx))
+        if meta is not None:
+            # Include task / scene metadata for env reconstruction in planning.
+            for key in [
+                "source_hdf5",
+                "demo_key",
+                "task",
+                "env_name",
+                "env_args",
+                "problem_info",
+                "has_sim_states",
+                "sim_states_shape",
+            ]:
+                if key in meta:
+                    env_info[key] = meta[key]
+
+        sim_state_path = self._sim_state_dir / f"episode_{idx:06d}.pth"
+        if sim_state_path.exists():
+            env_info["sim_state_path"] = str(sim_state_path)
+            # Keep low-dim state trajectory for matching random sampled offsets back to sim-states.
+            traj_len = self.get_seq_length(idx)
+            env_info["state_traj"] = self._traj_slice(self.states, idx, traj_len)
+        return env_info
 
     def __getitem__(self, idx):
         return self.get_frames(idx, range(self.get_seq_length(idx)))

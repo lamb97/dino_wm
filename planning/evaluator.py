@@ -207,7 +207,7 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals = rearrange(i_visuals, "b t n c h w -> b (t n) c h w")
         i_visuals = i_visuals[:, : i_visuals.shape[1] - (self.frameskip - 1)]
 
-        correction = 0.3  # to distinguish env visuals and imagined visuals
+        correction = 0.0  # to distinguish env visuals and imagined visuals
 
         if save_video:
             for idx in range(e_visuals.shape[0]):

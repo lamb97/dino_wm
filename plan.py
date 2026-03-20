@@ -134,6 +134,9 @@ class PlanWorkspace:
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
         self.goal_H = cfg_dict["goal_H"]
+        self.full_episode = bool(cfg_dict.get("full_episode", False))
+        self.full_episode_traj_id = cfg_dict.get("full_episode_traj_id", None)
+        self.full_episode_goal_H = cfg_dict.get("full_episode_goal_H", None)
         self.action_dim = self.dset.action_dim * self.frameskip
         self.debug_dset_init = cfg_dict["debug_dset_init"]
 
@@ -187,13 +190,18 @@ class PlanWorkspace:
             log_filename=self.log_filename,
         )
 
-        # optional: assume planning horizon equals to goal horizon
-        from planning.mpc import MPCPlanner
-        if isinstance(self.planner, MPCPlanner):
-            self.planner.sub_planner.horizon = cfg_dict["goal_H"]
-            self.planner.n_taken_actions = cfg_dict["goal_H"]
-        else:
-            self.planner.horizon = cfg_dict["goal_H"]
+        # NOTE:
+        # Keep planner horizon / MPC n_taken_actions from planner config.
+        # Do NOT force them to goal_H here, so MPC can run receding horizon
+        # with e.g. horizon=5, n_taken_actions=5 while tracking a farther goal.
+        #
+        # (Previous behavior forcibly overwrote to goal_H.)
+        # from planning.mpc import MPCPlanner
+        # if isinstance(self.planner, MPCPlanner):
+        #     self.planner.sub_planner.horizon = cfg_dict["goal_H"]
+        #     self.planner.n_taken_actions = cfg_dict["goal_H"]
+        # else:
+        #     self.planner.horizon = cfg_dict["goal_H"]
 
         self.dump_targets()
 
@@ -230,16 +238,56 @@ class PlanWorkspace:
             self.state_g = rand_goal_state
             self.gt_actions = None
         else:
+            if self.full_episode:
+                if self.n_evals != 1:
+                    raise ValueError(
+                        "full_episode=true currently requires n_evals=1 to avoid variable-length batching."
+                    )
+                observations, states, actions, env_info = self.sample_full_episode_from_dset(
+                    traj_id=self.full_episode_traj_id
+                )
+                self.env.update_env(env_info)
+                init_state = np.array([states[0][0]])
+                full_actions = actions[0]
+                # World-model actions are chunked by frameskip, so trim to a multiple.
+                usable_exec_steps = (full_actions.shape[0] // self.frameskip) * self.frameskip
+                if usable_exec_steps <= 0:
+                    raise ValueError(
+                        f"Episode too short for frameskip={self.frameskip}: action length={full_actions.shape[0]}"
+                    )
+                max_goal_h = usable_exec_steps // self.frameskip
+                if self.full_episode_goal_H is None:
+                    goal_h = max_goal_h
+                else:
+                    goal_h = int(self.full_episode_goal_H)
+                    if goal_h <= 0:
+                        raise ValueError(
+                            f"full_episode_goal_H must be positive, got {goal_h}"
+                        )
+                    if goal_h > max_goal_h:
+                        raise ValueError(
+                            f"full_episode_goal_H={goal_h} exceeds available goal horizon "
+                            f"{max_goal_h} for traj_id={self.full_episode_traj_id}"
+                        )
+                full_actions = full_actions[: self.frameskip * goal_h]
+                self.goal_H = int(goal_h)
+                self.cfg_dict["goal_H"] = int(goal_h)
+                print(
+                    f"[plan] full_episode enabled: traj_id={self.full_episode_traj_id if self.full_episode_traj_id is not None else 'random'} "
+                    f"usable_exec_steps={usable_exec_steps}, max_goal_H={max_goal_h}, goal_H={goal_h}"
+                )
+                actions = torch.stack([full_actions], dim=0)
+            else:
             # update env config from val trajs
-            observations, states, actions, env_info = (
-                self.sample_traj_segment_from_dset(traj_len=self.frameskip * self.goal_H + 1)
-            )
-            self.env.update_env(env_info)
+                observations, states, actions, env_info = (
+                    self.sample_traj_segment_from_dset(traj_len=self.frameskip * self.goal_H + 1)
+                )
+                self.env.update_env(env_info)
 
-            # get states from val trajs
-            init_state = [x[0] for x in states]
-            init_state = np.array(init_state)
-            actions = torch.stack(actions)
+                # get states from val trajs
+                init_state = [x[0] for x in states]
+                init_state = np.array(init_state)
+                actions = torch.stack(actions)
             if self.goal_source == "random_action":
                 actions = torch.randn_like(actions)
             wm_actions = rearrange(actions, "b (t f) d -> b t (f d)", f=self.frameskip)
@@ -259,6 +307,26 @@ class PlanWorkspace:
             self.state_0 = init_state  # (b, d)
             self.state_g = rollout_states[:, -1]  # (b, d)
             self.gt_actions = wm_actions
+
+    def sample_full_episode_from_dset(self, traj_id=None):
+        states = []
+        actions = []
+        observations = []
+        env_info = []
+
+        if traj_id is None:
+            traj_id = random.randint(0, len(self.dset) - 1)
+        if not (0 <= int(traj_id) < len(self.dset)):
+            raise ValueError(f"full_episode_traj_id out of range: {traj_id}")
+
+        obs, act, state, e_info = self.dset[int(traj_id)]
+        state = state.numpy()
+        observations.append(obs)
+        states.append(state)
+        actions.append(act)
+        env_info.append(e_info)
+        self.full_episode_traj_id = int(traj_id)
+        return observations, states, actions, env_info
 
     def sample_traj_segment_from_dset(self, traj_len):
         states = []
@@ -442,6 +510,13 @@ def planning_main(cfg_dict):
     model_path = f"{ckpt_base_path}/outputs/{cfg_dict['model_name']}/"
     with open(os.path.join(model_path, "hydra.yaml"), "r") as f:
         model_cfg = OmegaConf.load(f)
+    with open_dict(model_cfg):
+        if cfg_dict.get("dataset_path") is not None:
+            model_cfg.env.dataset.data_path = cfg_dict["dataset_path"]
+            print(f"Planning dataset path override: {model_cfg.env.dataset.data_path}")
+        if cfg_dict.get("dataset_target") is not None:
+            model_cfg.env.dataset._target_ = cfg_dict["dataset_target"]
+            print(f"Planning dataset target override: {model_cfg.env.dataset._target_}")
 
     seed(cfg_dict["seed"])
     _, dset = hydra.utils.call(

@@ -47,10 +47,28 @@ class Preprocessor:
         return rearrange(obs_visual, "b t h w c -> b t c h w") / 255.0
 
     def transform_obs_visual(self, obs_visual):
-        transformed_obs_visual = torch.tensor(obs_visual)
-        transformed_obs_visual = self.preprocess_obs_visual(transformed_obs_visual)
-        transformed_obs_visual = self.transform(transformed_obs_visual)
-        return transformed_obs_visual
+        x = torch.as_tensor(obs_visual)
+
+        # Planning inputs are typically (b, t, h, w, c). torchvision Resize expects
+        # batched 4D tensors, so flatten (b, t) -> (b*t), transform, then restore.
+        if x.ndim == 5:
+            b, t = x.shape[:2]
+            x = rearrange(x, "b t h w c -> (b t) c h w").float() / 255.0
+            x = self.transform(x)
+            x = rearrange(x, "(b t) c h w -> b t c h w", b=b, t=t)
+            return x
+
+        # Fallback for already-batched visuals.
+        if x.ndim == 4:
+            if x.shape[-1] in (1, 3, 4):
+                x = rearrange(x, "b h w c -> b c h w").float() / 255.0
+            else:
+                x = x.float()
+                if x.max() > 1:
+                    x = x / 255.0
+            return self.transform(x)
+
+        raise ValueError(f"Unsupported visual obs shape: {tuple(x.shape)}")
     
     def transform_obs(self, obs):
         '''
