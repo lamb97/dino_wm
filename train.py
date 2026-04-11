@@ -184,18 +184,23 @@ class Trainer:
     def save_ckpt(self):
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
-            if not os.path.exists("checkpoints"):
-                os.makedirs("checkpoints")
+            ckpt_dir = os.path.join(os.getcwd(), "checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
             ckpt = {}
             for k in self._keys_to_save:
                 if hasattr(self.__dict__[k], "module"):
                     ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
                 else:
                     ckpt[k] = self.__dict__[k]
-            torch.save(ckpt, "checkpoints/model_latest.pth")
-            torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+            epoch_ckpt_path = os.path.join(ckpt_dir, f"model_{self.epoch}.pth")
+            latest_ckpt_path = os.path.join(ckpt_dir, "model_latest.pth")
+            latest_tmp_path = os.path.join(ckpt_dir, f"model_latest.tmp.{os.getpid()}.pth")
+
+            torch.save(ckpt, epoch_ckpt_path)
+            torch.save(ckpt, latest_tmp_path)
+            os.replace(latest_tmp_path, latest_ckpt_path)
             log.info("Saved model to {}".format(os.getcwd()))
-            ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
+            ckpt_path = epoch_ckpt_path
         else:
             ckpt_path = None
         model_name = self.cfg["saved_folder"].split("outputs/")[-1]
@@ -244,9 +249,9 @@ class Trainer:
 
         self.action_encoder = self.accelerator.prepare(self.action_encoder)
 
-        if self.accelerator.is_main_process:
-            self.wandb_run.watch(self.action_encoder)
-            self.wandb_run.watch(self.proprio_encoder)
+        # if self.accelerator.is_main_process:
+            # self.wandb_run.watch(self.action_encoder)
+            # self.wandb_run.watch(self.proprio_encoder)
 
         # initialize predictor
         if self.encoder.latent_ndim == 1:  # if feature is 1D

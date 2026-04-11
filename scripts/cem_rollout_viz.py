@@ -114,6 +114,7 @@ def sample_segments(
     obsg_visuals = []
     obsg_proprios = []
     gt_visuals = []
+    gt_proprios = []
     meta = []
 
     needed = goal_h * frameskip + 1
@@ -137,6 +138,7 @@ def sample_segments(
         obsg_visuals.append(obs_visual_full[-1:].clone())
         obsg_proprios.append(obs_proprio_full[-1:].clone())
         gt_visuals.append(obs_visual_full)
+        gt_proprios.append(obs_proprio_full)
         meta.append({"traj_idx": traj_idx, "start": start})
 
     obs_0 = {
@@ -147,8 +149,75 @@ def sample_segments(
         "visual": torch.stack(obsg_visuals, dim=0),
         "proprio": torch.stack(obsg_proprios, dim=0),
     }
-    gt_visuals = torch.stack(gt_visuals, dim=0)
-    return obs_0, obs_g, gt_visuals, meta
+    gt_obs = {
+        "visual": torch.stack(gt_visuals, dim=0),
+        "proprio": torch.stack(gt_proprios, dim=0),
+    }
+    return obs_0, obs_g, gt_obs, meta
+
+
+def plan_open_loop_rollout(planner, model, obs_0, obs_g):
+    actions, _ = planner.plan(obs_0=obs_0, obs_g=obs_g, actions=None)
+    trans_obs_0 = move_to_device(planner.preprocessor.transform_obs(obs_0), planner.device)
+    z_obses, _ = model.rollout(obs_0=trans_obs_0, act=actions)
+    imagined_visuals = model.decode_obs(z_obses)[0]["visual"].cpu()
+    return actions.cpu(), imagined_visuals
+
+
+def plan_segmented_rollout(planner, model, gt_obs, goal_h, n_past, subgoal_h):
+    if subgoal_h <= 0:
+        raise ValueError(f"subgoal_h must be positive, got {subgoal_h}.")
+
+    b = gt_obs["visual"].shape[0]
+    imagined_visuals = gt_obs["visual"].new_zeros(gt_obs["visual"].shape)
+    actions = gt_obs["visual"].new_zeros((b, goal_h, planner.action_dim))
+    segment_meta = []
+    current_obs_idx = n_past - 1
+    original_horizon = planner.horizon
+
+    try:
+        while current_obs_idx < goal_h:
+            exec_h = min(subgoal_h, goal_h - current_obs_idx)
+            history_start = current_obs_idx - n_past + 1
+            segment_goal_idx = current_obs_idx + exec_h
+            planner.horizon = segment_goal_idx - history_start
+
+            obs_0 = {
+                key: value[:, history_start : current_obs_idx + 1].clone()
+                for key, value in gt_obs.items()
+            }
+            obs_g = {
+                key: value[:, segment_goal_idx : segment_goal_idx + 1].clone()
+                for key, value in gt_obs.items()
+            }
+
+            local_actions, local_visuals = plan_open_loop_rollout(
+                planner=planner,
+                model=model,
+                obs_0=obs_0,
+                obs_g=obs_g,
+            )
+            imagined_visuals[:, history_start : segment_goal_idx + 1] = local_visuals
+            if history_start == 0:
+                actions[:, : planner.horizon] = local_actions
+            else:
+                actions[:, current_obs_idx:segment_goal_idx] = local_actions[:, n_past - 1 :]
+
+            segment_meta.append(
+                {
+                    "history_start_idx": int(history_start),
+                    "current_obs_idx": int(current_obs_idx),
+                    "segment_goal_idx": int(segment_goal_idx),
+                    "planner_horizon": int(planner.horizon),
+                    "exec_h": int(exec_h),
+                    "obs_refresh_source": "ground_truth",
+                }
+            )
+            current_obs_idx = segment_goal_idx
+    finally:
+        planner.horizon = original_horizon
+
+    return actions, imagined_visuals, segment_meta
 
 
 def save_rollout_plot(gt_visuals, imagined_visuals, out_png):
@@ -229,6 +298,15 @@ def main():
         help="Planning horizon / goal distance (in downsampled steps). Defaults to plan.yaml goal_H.",
     )
     parser.add_argument(
+        "--subgoal-h",
+        type=int,
+        default=None,
+        help=(
+            "If set smaller than goal-h, replan every subgoal-h downsampled execution steps. "
+            "After each chunk, the current observation is refreshed from GT."
+        ),
+    )
+    parser.add_argument(
         "--n-past",
         type=int,
         default=None,
@@ -261,10 +339,14 @@ def main():
     plan_cfg = OmegaConf.load(args.plan_cfg)
     planner_cfg = OmegaConf.load(args.planner_cfg)
     goal_h = int(args.goal_h) if args.goal_h is not None else int(plan_cfg.goal_H)
+    subgoal_h = int(args.subgoal_h) if args.subgoal_h is not None else None
     n_past = int(args.n_past) if args.n_past is not None else int(model_cfg.num_hist)
+    use_segmented_replan = subgoal_h is not None and subgoal_h < goal_h
 
     if n_past > goal_h:
         raise ValueError(f"n_past ({n_past}) must be <= goal_h ({goal_h}).")
+    if subgoal_h is not None and subgoal_h <= 0:
+        raise ValueError(f"subgoal_h must be positive, got {subgoal_h}.")
 
     objective_fn = create_objective_fn(
         alpha=float(plan_cfg.objective.alpha),
@@ -288,7 +370,7 @@ def main():
         log_filename=None,
     )
 
-    obs_0, obs_g, gt_visuals, meta = sample_segments(
+    obs_0, obs_g, gt_obs, meta = sample_segments(
         dset=dset,
         num_rollout=args.num_rollout,
         goal_h=goal_h,
@@ -296,12 +378,27 @@ def main():
         n_past=n_past,
         rng=rng,
     )
+    gt_visuals = gt_obs["visual"]
 
     with torch.no_grad():
-        actions, _ = planner.plan(obs_0=obs_0, obs_g=obs_g, actions=None)
-        trans_obs_0 = move_to_device(planner.preprocessor.transform_obs(obs_0), planner.device)
-        z_obses, _ = model.rollout(obs_0=trans_obs_0, act=actions)
-        imagined_visuals = model.decode_obs(z_obses)[0]["visual"].cpu()  # [B, goal_h+1, C, H, W]
+        if use_segmented_replan:
+            actions, imagined_visuals, replan_segments = plan_segmented_rollout(
+                planner=planner,
+                model=model,
+                gt_obs=gt_obs,
+                goal_h=goal_h,
+                n_past=n_past,
+                subgoal_h=subgoal_h,
+            )
+        else:
+            planner.horizon = goal_h
+            actions, imagined_visuals = plan_open_loop_rollout(
+                planner=planner,
+                model=model,
+                obs_0=obs_0,
+                obs_g=obs_g,
+            )
+            replan_segments = []
 
     out_root = (
         Path(args.output_dir).resolve()
@@ -310,27 +407,32 @@ def main():
     )
     out_root.mkdir(parents=True, exist_ok=True)
     epoch_tag = str(loaded_epoch) if loaded_epoch is not None else "unknown"
-    out_png = out_root / f"cem_rollout_e{epoch_tag}_{args.split}_n{args.num_rollout}.png"
-    per_traj_dir = out_root / f"cem_rollout_e{epoch_tag}_{args.split}_n{args.num_rollout}_per_traj"
-    out_actions = out_root / f"cem_actions_e{epoch_tag}_{args.split}_n{args.num_rollout}.pt"
-    out_meta = out_root / f"cem_meta_e{epoch_tag}_{args.split}_n{args.num_rollout}.pt"
+    mode_tag = f"_sg{subgoal_h}" if use_segmented_replan else ""
+    out_png = out_root / f"cem_rollout_e{epoch_tag}_{args.split}_n{args.num_rollout}{mode_tag}.png"
+    per_traj_dir = out_root / f"cem_rollout_e{epoch_tag}_{args.split}_n{args.num_rollout}{mode_tag}_per_traj"
+    out_actions = out_root / f"cem_actions_e{epoch_tag}_{args.split}_n{args.num_rollout}{mode_tag}.pt"
+    out_meta = out_root / f"cem_meta_e{epoch_tag}_{args.split}_n{args.num_rollout}{mode_tag}.pt"
 
     save_rollout_plot(gt_visuals, imagined_visuals, str(out_png))
     save_rollout_plot_per_traj(
         gt_visuals=gt_visuals,
         imagined_visuals=imagined_visuals,
         out_dir=per_traj_dir,
-        prefix=f"cem_rollout_e{epoch_tag}_{args.split}",
+        prefix=f"cem_rollout_e{epoch_tag}_{args.split}{mode_tag}",
     )
     torch.save(actions.cpu(), out_actions)
     torch.save(
         {
             "meta": meta,
             "goal_h": goal_h,
+            "subgoal_h": subgoal_h,
             "n_past": n_past,
             "frameskip": int(model_cfg.frameskip),
             "model_epoch": loaded_epoch,
             "split": args.split,
+            "use_segmented_replan": use_segmented_replan,
+            "replan_obs_source": "ground_truth" if use_segmented_replan else None,
+            "replan_segments": replan_segments,
         },
         out_meta,
     )

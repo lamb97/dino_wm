@@ -310,6 +310,7 @@ def load_libero_slice_train_val(
     n_rollout=None,
     normalize_action=True,
     split_ratio=0.9,
+    val_indices=None,
     num_hist=0,
     num_pred=0,
     frameskip=1,
@@ -338,6 +339,7 @@ def load_libero_slice_train_val(
         random_seed=random_seed,
         num_frames=num_hist + num_pred,
         frameskip=frameskip,
+        val_indices=val_indices,
     )
 
     datasets = {"train": train_slices, "valid": val_slices}

@@ -1,6 +1,7 @@
 import os
 import gym
 import json
+import copy
 import hydra
 import random
 import torch
@@ -19,7 +20,7 @@ from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
 from preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
-from utils import cfg_to_dict, seed
+from utils import cfg_to_dict, seed, slice_trajdict_with_t
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -44,7 +45,8 @@ def launch_plan_jobs(
     with submitit.helpers.clean_env():
         jobs = []
         for cfg_dict in cfg_dicts:
-            subdir_name = f"{cfg_dict['planner']['name']}_goal_source={cfg_dict['goal_source']}_goal_H={cfg_dict['goal_H']}_alpha={cfg_dict['objective']['alpha']}"
+            subgoal_tag = "" if cfg_dict.get("subgoal_H") is None else f"_subgoal_H={cfg_dict['subgoal_H']}"
+            subdir_name = f"{cfg_dict['planner']['name']}_goal_source={cfg_dict['goal_source']}_goal_H={cfg_dict['goal_H']}{subgoal_tag}_alpha={cfg_dict['objective']['alpha']}"
             subdir_path = os.path.join(plan_output_dir, subdir_name)
             executor = submitit.AutoExecutor(
                 folder=subdir_path, slurm_max_num_timeout=20
@@ -75,6 +77,7 @@ def build_plan_cfg_dicts(
     goal_source=["dset"],
     goal_H=[1, 5, 10],
     alpha=[0, 0.1, 1],
+    subgoal_H=None,
 ):
     """
     Return a list of plan overrides, for model_path, add a key in the dict {"model_path": model_path}.
@@ -89,6 +92,7 @@ def build_plan_cfg_dicts(
             "model_name": model_name,
             "model_epoch": model_epoch,
             "objective": {"alpha": a},
+            "subgoal_H": subgoal_H,
         }
         for p, g_source, g_H, a in product(planner, goal_source, goal_H, alpha)
     ]
@@ -104,8 +108,39 @@ def build_plan_cfg_dicts(
         cfg = OmegaConf.merge(cfg, OmegaConf.create(override_args))
         cfg_dict = OmegaConf.to_container(cfg)
         cfg_dict["planner"]["horizon"] = cfg_dict["goal_H"]  # assume planning horizon equals to goal horizon
+        cfg_dict = maybe_configure_subgoal_planner_cfg(cfg_dict)
         cfg_dicts.append(cfg_dict)
     return cfg_dicts
+
+
+def maybe_configure_subgoal_planner_cfg(cfg_dict):
+    subgoal_h = cfg_dict.get("subgoal_H", None)
+    if subgoal_h is None:
+        return cfg_dict
+
+    subgoal_h = int(subgoal_h)
+    goal_h = int(cfg_dict["goal_H"])
+    if subgoal_h <= 0:
+        raise ValueError(f"subgoal_H must be positive, got {subgoal_h}")
+    if subgoal_h > goal_h:
+        raise ValueError(
+            f"subgoal_H ({subgoal_h}) must be <= goal_H ({goal_h})"
+        )
+
+    cfg_dict = copy.deepcopy(cfg_dict)
+    planner_cfg = copy.deepcopy(cfg_dict["planner"])
+    is_mpc = planner_cfg.get("_target_") == "planning.mpc.MPCPlanner"
+    if is_mpc:
+        raise ValueError(
+            "Top-level subgoal_H now means rolling subgoals with env feedback and goal updates. "
+            "Please use a non-MPC planner such as planner=cem or planner=gd."
+        )
+    if "horizon" in planner_cfg:
+        planner_cfg["horizon"] = subgoal_h
+
+    cfg_dict["planner"] = planner_cfg
+    cfg_dict["subgoal_H"] = subgoal_h
+    return cfg_dict
 
 
 class PlanWorkspace:
@@ -134,11 +169,16 @@ class PlanWorkspace:
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
         self.goal_H = cfg_dict["goal_H"]
+        self.subgoal_H = cfg_dict.get("subgoal_H", None)
+        if self.subgoal_H is not None:
+            self.subgoal_H = int(self.subgoal_H)
         self.full_episode = bool(cfg_dict.get("full_episode", False))
         self.full_episode_traj_id = cfg_dict.get("full_episode_traj_id", None)
         self.full_episode_goal_H = cfg_dict.get("full_episode_goal_H", None)
         self.action_dim = self.dset.action_dim * self.frameskip
         self.debug_dset_init = cfg_dict["debug_dset_init"]
+        self.target_rollout_obses = None
+        self.target_rollout_states = None
 
         objective_fn = hydra.utils.call(
             cfg_dict["objective"],
@@ -296,6 +336,8 @@ class PlanWorkspace:
             rollout_obses, rollout_states = self.env.rollout(
                 self.eval_seed, init_state, exec_actions.numpy()
             )
+            self.target_rollout_obses = rollout_obses
+            self.target_rollout_states = rollout_states
             self.obs_0 = {
                 key: np.expand_dims(arr[:, 0], axis=1)
                 for key, arr in rollout_obses.items()
@@ -373,6 +415,8 @@ class PlanWorkspace:
         self.state_g = data["state_g"]
         self.gt_actions = data["gt_actions"]
         self.goal_H = data["goal_H"]
+        self.target_rollout_obses = data.get("target_rollout_obses")
+        self.target_rollout_states = data.get("target_rollout_states")
 
     def dump_targets(self):
         with open("plan_targets.pkl", "wb") as f:
@@ -384,13 +428,135 @@ class PlanWorkspace:
                     "state_g": self.state_g,
                     "gt_actions": self.gt_actions,
                     "goal_H": self.goal_H,
+                    "subgoal_H": self.subgoal_H,
+                    "target_rollout_obses": self.target_rollout_obses,
+                    "target_rollout_states": self.target_rollout_states,
                 },
                 f,
             )
         file_path = os.path.abspath("plan_targets.pkl")
         print(f"Dumped plan targets to {file_path}")
 
+    def _dump_log_entry(self, logs):
+        logs_entry = {
+            key: (
+                value.item()
+                if isinstance(value, (np.float32, np.int32, np.int64))
+                else value
+            )
+            for key, value in logs.items()
+        }
+        with open(self.log_filename, "a") as file:
+            file.write(json.dumps(logs_entry) + "\n")
+
+    def _set_planner_horizon(self, horizon):
+        if hasattr(self.planner, "sub_planner"):
+            raise ValueError(
+                "Top-level subgoal_H uses an outer rolling-subgoal loop and does not support MPC planners. "
+                "Please use planner=cem or planner=gd."
+            )
+        if not hasattr(self.planner, "horizon"):
+            raise ValueError("Planner does not expose a horizon attribute.")
+        self.planner.horizon = int(horizon)
+
+    def _get_subgoal_cond(self, goal_h):
+        if self.target_rollout_obses is None or self.target_rollout_states is None:
+            raise ValueError(
+                "subgoal_H requires a target trajectory with intermediate env observations/states. "
+                "This is supported for goal_source=dset/random_action and files that provide target_rollout_obses/states."
+            )
+        goal_idx = int(goal_h) * self.frameskip
+        obs_g = {
+            key: np.expand_dims(arr[:, goal_idx], axis=1)
+            for key, arr in self.target_rollout_obses.items()
+        }
+        state_g = self.target_rollout_states[:, goal_idx]
+        return obs_g, state_g
+
+    def perform_subgoal_planning(self):
+        if self.subgoal_H is None:
+            raise ValueError("perform_subgoal_planning called without subgoal_H")
+
+        if self.target_rollout_obses is None or self.target_rollout_states is None:
+            raise ValueError(
+                "subgoal_H requires intermediate target observations/states, which are unavailable for the current goal source."
+            )
+
+        initial_obs_0 = self.obs_0
+        initial_state_0 = self.state_0
+        final_obs_g = self.obs_g
+        final_state_g = self.state_g
+        current_obs_0 = self.obs_0
+        current_state_0 = self.state_0
+        accumulated_actions = []
+        original_horizon = getattr(self.planner, "horizon", None)
+        segment_start_h = 0
+        segment_idx = 0
+
+        try:
+            while segment_start_h < self.goal_H:
+                segment_end_h = min(segment_start_h + self.subgoal_H, self.goal_H)
+                current_horizon = segment_end_h - segment_start_h
+                self._set_planner_horizon(current_horizon)
+                current_obs_g, current_state_g = self._get_subgoal_cond(segment_end_h)
+                self.evaluator.assign_init_cond(current_obs_0, current_state_0)
+                self.evaluator.assign_goal_cond(current_obs_g, current_state_g)
+
+                if hasattr(self.planner, "logging_prefix"):
+                    self.planner.logging_prefix = f"subgoal_{segment_idx}"
+
+                if self.debug_dset_init and self.gt_actions is not None:
+                    actions_init = self.gt_actions[:, segment_start_h:segment_end_h]
+                else:
+                    actions_init = None
+
+                planned_actions, _ = self.planner.plan(
+                    obs_0=current_obs_0,
+                    obs_g=current_obs_g,
+                    actions=actions_init,
+                )
+                taken_actions = planned_actions.detach()[:, :current_horizon]
+                accumulated_actions.append(taken_actions)
+
+                subgoal_logs, _, e_obses, e_states = self.evaluator.eval_actions(
+                    taken_actions,
+                    action_len=None,
+                    filename=f"subgoal_{segment_idx}",
+                    save_video=False,
+                )
+                subgoal_logs = {f"subgoal_eval/{k}": v for k, v in subgoal_logs.items()}
+                subgoal_logs.update(
+                    {
+                        "subgoal_eval/segment_idx": segment_idx,
+                        "subgoal_eval/segment_end_h": segment_end_h,
+                    }
+                )
+                self.wandb_run.log(subgoal_logs)
+                self._dump_log_entry(subgoal_logs)
+
+                current_obs_0 = slice_trajdict_with_t(e_obses, start_idx=-1)
+                current_state_0 = e_states[:, -1]
+                segment_start_h = segment_end_h
+                segment_idx += 1
+        finally:
+            if original_horizon is not None and hasattr(self.planner, "horizon"):
+                self.planner.horizon = original_horizon
+
+        actions = torch.cat(accumulated_actions, dim=1)
+        self.evaluator.assign_init_cond(initial_obs_0, initial_state_0)
+        self.evaluator.assign_goal_cond(final_obs_g, final_state_g)
+        logs, successes, _, _ = self.evaluator.eval_actions(
+            actions.detach(), None, save_video=True, filename="output_final"
+        )
+        logs = {f"final_eval/{k}": v for k, v in logs.items()}
+        self.wandb_run.log(logs)
+        self._dump_log_entry(logs)
+        return logs
+
     def perform_planning(self):
+        if self.subgoal_H is not None:
+            return self.perform_subgoal_planning()
+
         if self.debug_dset_init:
             actions_init = self.gt_actions
         else:
@@ -405,16 +571,7 @@ class PlanWorkspace:
         )
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
-        logs_entry = {
-            key: (
-                value.item()
-                if isinstance(value, (np.float32, np.int32, np.int64))
-                else value
-            )
-            for key, value in logs.items()
-        }
-        with open(self.log_filename, "a") as file:
-            file.write(json.dumps(logs_entry) + "\n")
+        self._dump_log_entry(logs)
         return logs
 
 
@@ -496,6 +653,7 @@ class DummyWandbRun:
 
 
 def planning_main(cfg_dict):
+    cfg_dict = maybe_configure_subgoal_planner_cfg(cfg_dict)
     output_dir = cfg_dict["saved_folder"]
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if cfg_dict["wandb_logging"]:

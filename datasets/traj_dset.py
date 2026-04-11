@@ -153,12 +153,25 @@ def get_train_val_sliced(
     random_seed: int = 42,
     num_frames: int = 10,
     frameskip: int = 1,
+    val_indices: Optional[Sequence[int]] = None,
 ):
-    train, val = split_traj_datasets(
-        traj_dataset,
-        train_fraction=train_fraction,
-        random_seed=random_seed,
-    )
+    if val_indices is None:
+        train, val = split_traj_datasets(
+            traj_dataset,
+            train_fraction=train_fraction,
+            random_seed=random_seed,
+        )
+    else:
+        val_index_set = {int(idx) for idx in val_indices}
+        all_index_set = set(range(len(traj_dataset)))
+        invalid = sorted(val_index_set - all_index_set)
+        if invalid:
+            raise ValueError(f"val_indices contains invalid episode indices: {invalid}")
+        train_indices = sorted(all_index_set - val_index_set)
+        val_indices = sorted(val_index_set)
+        print(f"Using explicit val_indices={val_indices}")
+        train = TrajSubset(traj_dataset, train_indices)
+        val = TrajSubset(traj_dataset, val_indices)
     train_slices = TrajSlicerDataset(train, num_frames, frameskip)
     val_slices = TrajSlicerDataset(val, num_frames, frameskip)
     return train, val, train_slices, val_slices

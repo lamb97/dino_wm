@@ -406,7 +406,12 @@ class LiberoWrapper(gym.Env):
         self._debug("prepare: first env.reset()")
         self._env.reset()
 
-        sim_state = self._select_init_sim_state(init_state)
+        init_state_arr = np.asarray(init_state, dtype=np.float32)
+        exact_sim_state = (
+            self._episode_sim_states is not None
+            and init_state_arr.shape[-1] == self._episode_sim_states.shape[-1]
+        )
+        sim_state = self._select_init_sim_state(init_state_arr)
         if sim_state is not None:
             self._debug("prepare: set_init_state()")
             obs = self._env.set_init_state(sim_state)
@@ -414,17 +419,18 @@ class LiberoWrapper(gym.Env):
             self._debug("prepare: fallback env.reset()")
             obs = self._env.reset()
 
-        # Let contact dynamics settle before rollout.
-        zero = np.zeros(self.action_dim, dtype=np.float32)
-        self._debug(f"prepare: stabilize with {self.stabilize_steps} zero steps")
-        for step_idx in range(self.stabilize_steps):
-            obs, _, _, _ = self._env.step(zero)
-            if step_idx == 0:
-                self._debug("prepare: first stabilize step finished")
+        # Let contact dynamics settle when restoring from approximate episode states.
+        if not exact_sim_state:
+            zero = np.zeros(self.action_dim, dtype=np.float32)
+            self._debug(f"prepare: stabilize with {self.stabilize_steps} zero steps")
+            for step_idx in range(self.stabilize_steps):
+                obs, _, _, _ = self._env.step(zero)
+                if step_idx == 0:
+                    self._debug("prepare: first stabilize step finished")
 
         self._debug("prepare: building dino obs")
         dino_obs = self._obs_to_dino(obs)
-        state = dino_obs["proprio"].copy()
+        state = self._env.get_sim_state().copy().astype(np.float32)
         self._debug("prepare done")
         return dino_obs, state
 
@@ -456,7 +462,7 @@ class LiberoWrapper(gym.Env):
             rewards.append(float(reward))
             dones.append(bool(done))
             info = dict(info)
-            info["state"] = dino_obs["proprio"]
+            info["state"] = self._env.get_sim_state().copy().astype(np.float32)
             info["success"] = bool(done)
             infos.append(info)
 
@@ -500,7 +506,7 @@ class LiberoWrapper(gym.Env):
         self._debug("prepare: building dino obs")
         dino_obs = self._obs_to_dino(obs)
         info = dict(info)
-        info["state"] = dino_obs["proprio"]
+        info["state"] = self._env.get_sim_state().copy().astype(np.float32)
         return dino_obs, reward, done, info
 
     def close(self):
