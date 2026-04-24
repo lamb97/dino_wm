@@ -1,0 +1,49 @@
+name: real_data_multi
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.libero_delta_dset.load_libero_slice_train_val"
+  n_rollout: null
+  normalize_action: ${normalize_action}
+  data_path:
+    - /projects/standard/kdesingh/shared/liu03222/shared_account_dinowm_224
+    - /projects/standard/kdesingh/shared/liu03222/0421_ur5e_data_dinowm_224
+  split_ratio: 0.9
+  val_indices:
+    - 0
+    - 10
+    - 20
+    - 70
+    - 60
+    - 50
+    - 30
+    - 40
+    - 80
+    - 90
+    - 100
+    - 110
+    - 120
+    - 130
+    - 140
+    - 150
+    - 160
+    - 170
+    - 180
+    - 200
+    - 190
+    - 210
+    - 220
+    - 230
+
+  use_mmap: true
+  mmap_mode: r
+  image_use_mmap: true
+  image_mmap_mode: r
+  image_cache_size: 8
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 16

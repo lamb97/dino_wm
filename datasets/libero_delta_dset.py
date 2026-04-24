@@ -3,8 +3,10 @@ import json
 import numpy as np
 import torch
 from pathlib import Path
-from typing import Optional, Callable
+from bisect import bisect_right
+from typing import Optional, Callable, Sequence, Union
 from collections import OrderedDict
+from omegaconf import ListConfig
 
 from .traj_dset import TrajDataset, get_train_val_sliced
 
@@ -304,6 +306,155 @@ class LiberoDeltaDataset(TrajDataset):
         raise TypeError(f"Unsupported image type: {type(imgs)}")
 
 
+class MultiLiberoDeltaDataset(TrajDataset):
+    def __init__(
+        self,
+        data_paths: Sequence[Union[str, Path]],
+        n_rollout: Optional[int] = None,
+        transform: Optional[Callable] = None,
+        normalize_action: bool = True,
+        use_mmap: bool = False,
+        mmap_mode: str = "r",
+        image_use_mmap: bool = True,
+        image_mmap_mode: str = "r",
+        image_cache_size: int = 8,
+    ):
+        if len(data_paths) == 0:
+            raise ValueError("data_paths must contain at least one dataset path")
+
+        self.datasets = []
+        for data_path in data_paths:
+            self.datasets.append(
+                LiberoDeltaDataset(
+                    data_path=str(data_path),
+                    n_rollout=None,
+                    transform=transform,
+                    normalize_action=False,
+                    use_mmap=use_mmap,
+                    mmap_mode=mmap_mode,
+                    image_use_mmap=image_use_mmap,
+                    image_mmap_mode=image_mmap_mode,
+                    image_cache_size=image_cache_size,
+                )
+            )
+
+        self._dataset_lengths = [len(d) for d in self.datasets]
+        self._dataset_offsets = [0]
+        for length in self._dataset_lengths:
+            self._dataset_offsets.append(self._dataset_offsets[-1] + int(length))
+
+        total_rollouts = self._dataset_offsets[-1]
+        if n_rollout is not None:
+            self.n_rollout = min(int(n_rollout), total_rollouts)
+        else:
+            self.n_rollout = total_rollouts
+
+        self.state_dim = self.datasets[0].state_dim
+        self.action_dim = self.datasets[0].action_dim
+        self.proprio_dim = self.datasets[0].proprio_dim
+        for dset in self.datasets[1:]:
+            if dset.state_dim != self.state_dim or dset.action_dim != self.action_dim:
+                raise ValueError(
+                    "All datasets must share the same state/action dimensions to be concatenated"
+                )
+
+        self.transform = transform
+        self.normalize_action = normalize_action
+        self.action_mean, self.action_std = self._compute_combined_mean_std(kind="action")
+        self.state_mean, self.state_std = self._compute_combined_mean_std(kind="state")
+        self.proprio_mean, self.proprio_std = self.state_mean.clone(), self.state_std.clone()
+        self.action_std = torch.clamp(self.action_std, min=1e-6)
+        self.state_std = torch.clamp(self.state_std, min=1e-6)
+        self.proprio_std = torch.clamp(self.proprio_std, min=1e-6)
+
+        if not normalize_action:
+            self.action_mean.zero_()
+            self.action_std.fill_(1.0)
+            self.state_mean.zero_()
+            self.state_std.fill_(1.0)
+            self.proprio_mean.zero_()
+            self.proprio_std.fill_(1.0)
+
+        joined_paths = ", ".join(str(Path(p)) for p in data_paths)
+        print(f"Loaded {self.n_rollout} LIBERO trajectories from [{joined_paths}]")
+
+    def _compute_combined_mean_std(self, kind: str):
+        dim = self.action_dim if kind == "action" else self.state_dim
+        total_count = 0
+        total_sum = np.zeros(dim, dtype=np.float64)
+        total_sumsq = np.zeros(dim, dtype=np.float64)
+
+        remaining = self.n_rollout
+        for dset in self.datasets:
+            if remaining <= 0:
+                break
+            take = min(len(dset), remaining)
+            remaining -= take
+            for traj_idx in range(take):
+                t = dset.get_seq_length(traj_idx)
+                if t <= 0:
+                    continue
+                arr = dset.actions if kind == "action" else dset.states
+                x = dset._traj_slice(arr, traj_idx, t).astype(np.float64)
+                total_count += x.shape[0]
+                total_sum += x.sum(axis=0)
+                total_sumsq += (x * x).sum(axis=0)
+
+        if total_count == 0:
+            mean = np.zeros(dim, dtype=np.float32)
+            std = np.ones(dim, dtype=np.float32)
+        else:
+            mean = total_sum / total_count
+            var = total_sumsq / total_count - mean * mean
+            var = np.maximum(var, 1e-12)
+            std = np.sqrt(var)
+            mean = mean.astype(np.float32)
+            std = std.astype(np.float32)
+
+        return torch.from_numpy(mean), torch.from_numpy(std)
+
+    def _locate_index(self, idx: int):
+        if idx < 0 or idx >= self.n_rollout:
+            raise IndexError(f"Index {idx} out of range for {self.n_rollout} trajectories")
+        dataset_idx = bisect_right(self._dataset_offsets, idx) - 1
+        local_idx = idx - self._dataset_offsets[dataset_idx]
+        return dataset_idx, local_idx
+
+    def get_seq_length(self, idx):
+        dataset_idx, local_idx = self._locate_index(int(idx))
+        return self.datasets[dataset_idx].get_seq_length(local_idx)
+
+    def get_frames(self, idx, frames):
+        dataset_idx, local_idx = self._locate_index(int(idx))
+        obs, act, state, env_info = self.datasets[dataset_idx].get_frames(local_idx, frames)
+
+        if self.normalize_action:
+            obs["proprio"] = (state - self.proprio_mean) / self.proprio_std
+            act = (act - self.action_mean) / self.action_std
+        else:
+            obs["proprio"] = state
+
+        env_info = dict(env_info)
+        env_info["episode_idx"] = int(idx)
+        env_info["source_dataset_idx"] = int(dataset_idx)
+        env_info["source_episode_idx"] = int(local_idx)
+        return obs, act, state, env_info
+
+    def get_all_actions(self):
+        chunks = []
+        for idx in range(self.n_rollout):
+            t = self.get_seq_length(idx)
+            _, act, _, _ = self.get_frames(idx, slice(0, t))
+            chunks.append(act)
+        return torch.cat(chunks, dim=0)
+
+    def __getitem__(self, idx):
+        return self.get_frames(idx, range(self.get_seq_length(idx)))
+
+    def __len__(self):
+        return self.n_rollout
+
+
 def load_libero_slice_train_val(
     transform,
     data_path,
@@ -321,17 +472,31 @@ def load_libero_slice_train_val(
     image_mmap_mode="r",
     image_cache_size=8,
 ):
-    dset = LiberoDeltaDataset(
-        data_path=data_path,
-        n_rollout=n_rollout,
-        transform=transform,
-        normalize_action=normalize_action,
-        use_mmap=use_mmap,
-        mmap_mode=mmap_mode,
-        image_use_mmap=image_use_mmap,
-        image_mmap_mode=image_mmap_mode,
-        image_cache_size=image_cache_size,
-    )
+    if isinstance(data_path, (list, tuple, ListConfig)):
+        data_paths = [str(Path(path)) for path in data_path]
+        dset = MultiLiberoDeltaDataset(
+            data_paths=data_paths,
+            n_rollout=n_rollout,
+            transform=transform,
+            normalize_action=normalize_action,
+            use_mmap=use_mmap,
+            mmap_mode=mmap_mode,
+            image_use_mmap=image_use_mmap,
+            image_mmap_mode=image_mmap_mode,
+            image_cache_size=image_cache_size,
+        )
+    else:
+        dset = LiberoDeltaDataset(
+            data_path=data_path,
+            n_rollout=n_rollout,
+            transform=transform,
+            normalize_action=normalize_action,
+            use_mmap=use_mmap,
+            mmap_mode=mmap_mode,
+            image_use_mmap=image_use_mmap,
+            image_mmap_mode=image_mmap_mode,
+            image_cache_size=image_cache_size,
+        )
 
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset,
