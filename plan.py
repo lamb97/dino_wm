@@ -33,6 +33,15 @@ ALL_MODEL_KEYS = [
     "action_encoder",
 ]
 
+def data_stats_to_cpu(data_stats):
+    if data_stats is None:
+        return None
+    return {
+        key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in data_stats.items()
+    }
+
+
 def planning_main_in_dir(working_dir, cfg_dict):
     os.chdir(working_dir)
     return planning_main(cfg_dict=cfg_dict)
@@ -153,6 +162,7 @@ class PlanWorkspace:
         env_name: str,
         frameskip: int,
         wandb_run: wandb.run,
+        data_stats=None,
     ):
         self.cfg_dict = cfg_dict
         self.wm = wm
@@ -184,13 +194,17 @@ class PlanWorkspace:
             cfg_dict["objective"],
         )
 
+        data_stats = data_stats_to_cpu(data_stats)
+        if data_stats is None:
+            raise ValueError("PlanWorkspace requires data_stats loaded from the model checkpoint.")
+
         self.data_preprocessor = Preprocessor(
-            action_mean=self.dset.action_mean,
-            action_std=self.dset.action_std,
-            state_mean=self.dset.state_mean,
-            state_std=self.dset.state_std,
-            proprio_mean=self.dset.proprio_mean,
-            proprio_std=self.dset.proprio_std,
+            action_mean=data_stats["action_mean"],
+            action_std=data_stats["action_std"],
+            state_mean=data_stats["state_mean"],
+            state_std=data_stats["state_std"],
+            proprio_mean=data_stats["proprio_mean"],
+            proprio_std=data_stats["proprio_std"],
             transform=self.dset.transform,
         )
 
@@ -584,6 +598,8 @@ def load_ckpt(snapshot_path, device):
         if k in ALL_MODEL_KEYS:
             loaded_keys.append(k)
             result[k] = v.to(device)
+    if "data_stats" in payload:
+        result["data_stats"] = data_stats_to_cpu(payload["data_stats"])
     result["epoch"] = payload["epoch"]
     return result
 
@@ -632,7 +648,12 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
         num_proprio_repeat=train_cfg.num_proprio_repeat,
     )
     model.to(device)
-    return model
+    if "data_stats" not in result:
+        raise ValueError(
+            f"Checkpoint does not contain data_stats: {model_ckpt}. "
+            "Please use a checkpoint saved by the updated trainer."
+        )
+    return model, result["data_stats"]
 
 
 class DummyWandbRun:
@@ -689,7 +710,7 @@ def planning_main(cfg_dict):
     model_ckpt = (
         Path(model_path) / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
     )
-    model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
+    model, data_stats = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
@@ -720,6 +741,7 @@ def planning_main(cfg_dict):
         env_name=model_cfg.env.name,
         frameskip=model_cfg.frameskip,
         wandb_run=wandb_run,
+        data_stats=data_stats,
     )
 
     logs = plan_workspace.perform_planning()

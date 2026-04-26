@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import hydra
 import torch
 import wandb
@@ -181,6 +182,40 @@ class Trainer:
 
         self.epoch_log = OrderedDict()
 
+    @staticmethod
+    def _as_cpu_tensor(value):
+        return torch.as_tensor(value).detach().cpu().clone()
+
+    def get_data_stats(self):
+        dset = self.train_traj_dset
+        stats = {
+            "action_mean": self._as_cpu_tensor(dset.action_mean),
+            "action_std": self._as_cpu_tensor(dset.action_std),
+            "state_mean": self._as_cpu_tensor(dset.state_mean),
+            "state_std": self._as_cpu_tensor(dset.state_std),
+            "proprio_mean": self._as_cpu_tensor(dset.proprio_mean),
+            "proprio_std": self._as_cpu_tensor(dset.proprio_std),
+            "action_dim": int(dset.action_dim),
+            "state_dim": int(dset.state_dim),
+            "proprio_dim": int(dset.proprio_dim),
+            "normalize_action": bool(self.cfg.normalize_action),
+        }
+        return stats
+
+    def save_data_stats(self, ckpt_dir, data_stats):
+        stats_path = os.path.join(ckpt_dir, "data_stats.pth")
+        torch.save(data_stats, stats_path)
+
+        json_stats = {}
+        for key, value in data_stats.items():
+            if isinstance(value, torch.Tensor):
+                json_stats[key] = value.tolist()
+            else:
+                json_stats[key] = value
+        with open(os.path.join(ckpt_dir, "data_stats.json"), "w", encoding="utf-8") as f:
+            json.dump(json_stats, f, indent=2)
+            f.write("\n")
+
     def save_ckpt(self):
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
@@ -192,6 +227,7 @@ class Trainer:
                     ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
                 else:
                     ckpt[k] = self.__dict__[k]
+            ckpt["data_stats"] = self.get_data_stats()
             epoch_ckpt_path = os.path.join(ckpt_dir, f"model_{self.epoch}.pth")
             latest_ckpt_path = os.path.join(ckpt_dir, "model_latest.pth")
             latest_tmp_path = os.path.join(ckpt_dir, f"model_latest.tmp.{os.getpid()}.pth")
@@ -199,6 +235,7 @@ class Trainer:
             torch.save(ckpt, epoch_ckpt_path)
             torch.save(ckpt, latest_tmp_path)
             os.replace(latest_tmp_path, latest_ckpt_path)
+            self.save_data_stats(ckpt_dir, ckpt["data_stats"])
             log.info("Saved model to {}".format(os.getcwd()))
             ckpt_path = epoch_ckpt_path
         else:
@@ -237,7 +274,6 @@ class Trainer:
         )
         proprio_emb_dim = self.proprio_encoder.emb_dim
         print(f"Proprio encoder type: {type(self.proprio_encoder)}")
-        self.proprio_encoder = self.accelerator.prepare(self.proprio_encoder)
 
         self.action_encoder = hydra.utils.instantiate(
             self.cfg.action_encoder,
@@ -246,8 +282,6 @@ class Trainer:
         )
         action_emb_dim = self.action_encoder.emb_dim
         print(f"Action encoder type: {type(self.action_encoder)}")
-
-        self.action_encoder = self.accelerator.prepare(self.action_encoder)
 
         # if self.accelerator.is_main_process:
             # self.wandb_run.watch(self.action_encoder)
@@ -312,9 +346,22 @@ class Trainer:
 
         if self.cfg.has_predictor and self.predictor is not None:
             if self.train_predictor:
-                self.predictor = self.accelerator.prepare(self.predictor)
+                (
+                    self.predictor,
+                    self.action_encoder,
+                    self.proprio_encoder,
+                ) = self.accelerator.prepare(
+                    self.predictor,
+                    self.action_encoder,
+                    self.proprio_encoder,
+                )
             else:
                 self.predictor = self.predictor.to(self.device)
+                self.action_encoder = self.action_encoder.to(self.device)
+                self.proprio_encoder = self.proprio_encoder.to(self.device)
+        else:
+            self.action_encoder = self.action_encoder.to(self.device)
+            self.proprio_encoder = self.proprio_encoder.to(self.device)
 
         if self.cfg.has_decoder and self.decoder is not None:
             if self.train_decoder:
