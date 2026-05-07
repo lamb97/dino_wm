@@ -1,0 +1,14 @@
+defaults:
+  - train_lite6_xyz
+
+training:
+  batch_size: 128
+
+hydra:
+  launcher:
+    nodes: 1
+    tasks_per_node: 4
+    cpus_per_task: 8
+    mem_gb: 512
+    gres: "gpu:h100:4"
+    timeout_min: 2880

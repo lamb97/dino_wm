@@ -1,0 +1,18 @@
+defaults:
+  - train
+  - override env: lite6_demo_xyz
+
+ckpt_base_path: /users/6/liu03222/dino_wm_runs/lite6_xyz
+
+training:
+  batch_size: 32
+  epochs: 300
+
+img_size: 224
+frameskip: 5
+num_hist: 3
+num_pred: 1
+
+normalize_action: True
+
+debug: False
